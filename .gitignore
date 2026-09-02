@@ -1,0 +1,17 @@
+﻿# Arduino / PlatformIO / Wokwi build outputs
+build/
+*.bin
+*.elf
+*.hex
+
+# Python virtual environment & bridge caches
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+
+# VS Code / OS files
+.vscode/
+.DS_Store
+Thumbs.db

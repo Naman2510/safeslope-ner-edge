@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "author": "Naman Gautam",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-mpu6050", "id": "mpu1", "top": -150, "left": 250, "attrs": {} },
+    { "type": "wokwi-led", "id": "led1", "top": 50, "left": 190, "attrs": { "color": "red", "label": "CRITICAL" } },
+    { "type": "wokwi-resistor", "id": "r1", "top": 90, "left": 110, "attrs": { "value": "220" } },
+    { "type": "wokwi-buzzer", "id": "bz1", "top": 175, "left": 190, "attrs": { "volume": "1.0", "mode": "smooth" } },
+    { "type": "wokwi-potentiometer", "id": "pot_moist", "top": -120, "left": -240, "attrs": { "label": "Soil Moisture (%)" } },
+    { "type": "wokwi-potentiometer", "id": "pot_pore", "top": 60, "left": -240, "attrs": { "label": "Pore Pressure (kPa)" } },
+    { "type": "wokwi-pushbutton", "id": "btn_seismic", "top": 230, "left": -190, "attrs": { "label": "Seismic Trip", "color": "red", "bounce": "0" } }
+  ],
+  "connections": [
+
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+
+    [ "esp:3V3", "mpu1:VCC", "red", [ "v0" ] ],
+    [ "esp:GND.1", "mpu1:GND", "black", [ "v0" ] ],
+    [ "esp:21", "mpu1:SDA", "green", [ "v0" ] ],
+    [ "esp:22", "mpu1:SCL", "blue", [ "v0" ] ],
+
+    [ "esp:19", "r1:1", "purple", [ "v0" ] ],
+    [ "r1:2", "led1:A", "purple", [ "v0" ] ],
+    [ "led1:C", "esp:GND.1", "black", [ "v0" ] ],
+
+    [ "bz1:1", "esp:GND.2", "black", [ "v0" ] ],
+    [ "esp:18", "bz1:2", "orange", [ "v0" ] ],
+
+    [ "esp:3V3", "pot_moist:VCC", "red", [ "v0" ] ],
+    [ "esp:GND.1", "pot_moist:GND", "black", [ "v0" ] ],
+    [ "pot_moist:SIG", "esp:34", "yellow", [ "v0" ] ],
+
+    [ "esp:3V3", "pot_pore:VCC", "red", [ "v0" ] ],
+    [ "esp:GND.1", "pot_pore:GND", "black", [ "v0" ] ],
+    [ "pot_pore:SIG", "esp:35", "green", [ "v0" ] ],
+
+    [ "esp:3V3", "btn_seismic:1.l", "red", [ "v0" ] ],
+    [ "btn_seismic:2.l", "esp:4", "brown", [ "v0" ] ]
+  ],
+  "serialMonitor": {
+    "display": "terminal",
+    "collapse": false,
+    "convertEol": true,
+    "newline": "lf"
+  }
+}

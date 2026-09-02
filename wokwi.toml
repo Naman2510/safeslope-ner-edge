@@ -1,0 +1,5 @@
+[wokwi]
+version = 1
+firmware = "sketch/build/espressif.esp32.esp32/sketch.ino.bin"
+elf = "sketch/build/espressif.esp32.esp32/sketch.ino.elf"
+rfc2217ServerPort = 4001
