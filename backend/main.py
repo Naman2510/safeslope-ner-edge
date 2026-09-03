@@ -1,0 +1,788 @@
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import sqlite3
+
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field, ConfigDict
+
+
+app = FastAPI(
+    title="SafeSlope-NER Local Backend",
+    description="Telemetry receiver for the SafeSlope-NER landslide early-warning node",
+    version="1.2.0",
+)
+
+DATABASE_PATH = Path(__file__).with_name("telemetry.db")
+
+# Local development key only.
+# Do not commit a real production key to GitHub.
+LOCAL_API_KEY = "local-demo-key"
+
+
+class Telemetry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    # Required teammate backend fields
+    sensor_id: str = Field(min_length=1, max_length=100)
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    tilt_delta: float = Field(ge=-360, le=360)
+    soil_moisture: float = Field(ge=0, le=100)
+
+    # MPU6050
+    accelerometer_x: float | None = None
+    accelerometer_y: float | None = None
+    accelerometer_z: float | None = None
+    gyro_x: float | None = None
+    gyro_y: float | None = None
+    gyro_z: float | None = None
+    pitch_deg: float | None = None
+    roll_deg: float | None = None
+    angular_shift_rate_deg_per_sec: float | None = None
+    vibration_rms_g: float | None = None
+
+    # Hydrological values
+    soil_moisture_pct: float | None = Field(default=None, ge=0, le=100)
+    soil_moisture_source: str | None = None
+    soil_saturation_index: float | None = Field(default=None, ge=0, le=1)
+    pore_pressure_kpa: float | None = Field(default=None, ge=0)
+    pore_pressure_source: str | None = None
+    matrix_suction_kpa: float | None = None
+
+    # Acoustic values
+    acoustic_event_rate_hz: float | None = Field(default=None, ge=0)
+    acoustic_peak_mv: float | None = Field(default=None, ge=0)
+    acoustic_energy: float | None = Field(default=None, ge=0)
+    tripwire_flag: bool | None = None
+    acoustic_source: str | None = None
+
+    # Power and environment
+    battery_voltage_v: float | None = Field(default=None, ge=0)
+    battery_soc_pct: float | None = Field(default=None, ge=0, le=100)
+    solar_voltage_v: float | None = Field(default=None, ge=0)
+    internal_temperature_c: float | None = None
+
+    # Edge intelligence and communication
+    tinyml_anomaly_score: float | None = Field(default=None, ge=0, le=1)
+    operating_alert_mode: str | None = None
+    lorawan_rssi_dbm: float | None = None
+    lorawan_snr_db: float | None = None
+    packet_sequence_id: int | None = Field(default=None, ge=0)
+
+    # Project state
+    risk_state: str | None = None
+    trigger_cause: str | None = None
+
+    # Device health and timing
+    timestamp_ms: int | None = Field(default=None, ge=0)
+    mpu_ok: bool | None = None
+    moisture_valid: bool | None = None
+    pressure_valid: bool | None = None
+    acoustic_valid: bool | None = None
+    battery_valid: bool | None = None
+
+
+def get_connection():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_database():
+    connection = get_connection()
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telemetry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT NOT NULL,
+            sensor_id TEXT NOT NULL,
+            lat REAL NOT NULL,
+            lng REAL NOT NULL,
+            tilt_delta REAL NOT NULL,
+            soil_moisture REAL NOT NULL,
+            accelerometer_x REAL,
+            accelerometer_y REAL,
+            accelerometer_z REAL,
+            gyro_x REAL,
+            gyro_y REAL,
+            gyro_z REAL,
+            pitch_deg REAL,
+            roll_deg REAL,
+            angular_shift_rate_deg_per_sec REAL,
+            vibration_rms_g REAL,
+            soil_moisture_pct REAL,
+            soil_moisture_source TEXT,
+            soil_saturation_index REAL,
+            pore_pressure_kpa REAL,
+            pore_pressure_source TEXT,
+            matrix_suction_kpa REAL,
+            acoustic_event_rate_hz REAL,
+            acoustic_peak_mv REAL,
+            acoustic_energy REAL,
+            tripwire_flag INTEGER,
+            acoustic_source TEXT,
+            battery_voltage_v REAL,
+            battery_soc_pct REAL,
+            solar_voltage_v REAL,
+            internal_temperature_c REAL,
+            tinyml_anomaly_score REAL,
+            operating_alert_mode TEXT,
+            lorawan_rssi_dbm REAL,
+            lorawan_snr_db REAL,
+            packet_sequence_id INTEGER,
+            risk_state TEXT,
+            trigger_cause TEXT,
+            timestamp_ms INTEGER,
+            mpu_ok INTEGER,
+            moisture_valid INTEGER,
+            pressure_valid INTEGER,
+            acoustic_valid INTEGER,
+            battery_valid INTEGER
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT NOT NULL,
+            sensor_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            previous_state TEXT,
+            risk_state TEXT,
+            trigger_cause TEXT,
+            details TEXT
+        )
+        """
+    )
+
+    connection.commit()
+    connection.close()
+
+
+@app.on_event("startup")
+def startup():
+    initialize_database()
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "SafeSlope-NER Local Backend",
+        "status": "running",
+        "version": "1.2.0",
+        "docs": "/docs",
+        "dashboard": "/dashboard",
+        "telemetry_endpoint": "/telemetry/",
+    }
+
+
+@app.get("/health")
+def health():
+    connection = get_connection()
+
+    telemetry_count = connection.execute(
+        "SELECT COUNT(*) AS count FROM telemetry"
+    ).fetchone()["count"]
+
+    event_count = connection.execute(
+        "SELECT COUNT(*) AS count FROM events"
+    ).fetchone()["count"]
+
+    connection.close()
+
+    return {
+        "status": "healthy",
+        "database": str(DATABASE_PATH),
+        "telemetry_records": telemetry_count,
+        "event_records": event_count,
+    }
+
+
+@app.post("/telemetry/")
+def receive_telemetry(
+    telemetry: Telemetry,
+    x_api_key: str | None = Header(default=None),
+):
+    if x_api_key != LOCAL_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing X-API-Key",
+        )
+
+    received_at = datetime.now(timezone.utc).isoformat()
+    data = telemetry.model_dump()
+
+    connection = get_connection()
+
+    previous_row = connection.execute(
+        """
+        SELECT risk_state, trigger_cause
+        FROM telemetry
+        WHERE sensor_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (telemetry.sensor_id,),
+    ).fetchone()
+
+    previous_state = (
+        previous_row["risk_state"]
+        if previous_row is not None
+        else None
+    )
+
+    connection.execute(
+        """
+        INSERT INTO telemetry (
+            received_at,
+            sensor_id,
+            lat,
+            lng,
+            tilt_delta,
+            soil_moisture,
+            accelerometer_x,
+            accelerometer_y,
+            accelerometer_z,
+            gyro_x,
+            gyro_y,
+            gyro_z,
+            pitch_deg,
+            roll_deg,
+            angular_shift_rate_deg_per_sec,
+            vibration_rms_g,
+            soil_moisture_pct,
+            soil_moisture_source,
+            soil_saturation_index,
+            pore_pressure_kpa,
+            pore_pressure_source,
+            matrix_suction_kpa,
+            acoustic_event_rate_hz,
+            acoustic_peak_mv,
+            acoustic_energy,
+            tripwire_flag,
+            acoustic_source,
+            battery_voltage_v,
+            battery_soc_pct,
+            solar_voltage_v,
+            internal_temperature_c,
+            tinyml_anomaly_score,
+            operating_alert_mode,
+            lorawan_rssi_dbm,
+            lorawan_snr_db,
+            packet_sequence_id,
+            risk_state,
+            trigger_cause,
+            timestamp_ms,
+            mpu_ok,
+            moisture_valid,
+            pressure_valid,
+            acoustic_valid,
+            battery_valid
+        )
+        VALUES (
+            :received_at,
+            :sensor_id,
+            :lat,
+            :lng,
+            :tilt_delta,
+            :soil_moisture,
+            :accelerometer_x,
+            :accelerometer_y,
+            :accelerometer_z,
+            :gyro_x,
+            :gyro_y,
+            :gyro_z,
+            :pitch_deg,
+            :roll_deg,
+            :angular_shift_rate_deg_per_sec,
+            :vibration_rms_g,
+            :soil_moisture_pct,
+            :soil_moisture_source,
+            :soil_saturation_index,
+            :pore_pressure_kpa,
+            :pore_pressure_source,
+            :matrix_suction_kpa,
+            :acoustic_event_rate_hz,
+            :acoustic_peak_mv,
+            :acoustic_energy,
+            :tripwire_flag,
+            :acoustic_source,
+            :battery_voltage_v,
+            :battery_soc_pct,
+            :solar_voltage_v,
+            :internal_temperature_c,
+            :tinyml_anomaly_score,
+            :operating_alert_mode,
+            :lorawan_rssi_dbm,
+            :lorawan_snr_db,
+            :packet_sequence_id,
+            :risk_state,
+            :trigger_cause,
+            :timestamp_ms,
+            :mpu_ok,
+            :moisture_valid,
+            :pressure_valid,
+            :acoustic_valid,
+            :battery_valid
+        )
+        """,
+        {
+            "received_at": received_at,
+            **data,
+        },
+    )
+
+    current_state = telemetry.risk_state or "UNKNOWN"
+
+    if previous_state is None:
+        event_type = "INITIAL_STATE"
+    elif previous_state != current_state:
+        if current_state == "CRITICAL_FAILURE":
+            event_type = "CRITICAL_ENTERED"
+        elif current_state == "NORMAL":
+            event_type = "RECOVERED"
+        elif current_state == "WARNING_PENDING":
+            event_type = "WARNING_ENTERED"
+        else:
+            event_type = "STATE_CHANGED"
+    else:
+        event_type = None
+
+    if event_type is not None:
+        connection.execute(
+            """
+            INSERT INTO events (
+                received_at,
+                sensor_id,
+                event_type,
+                previous_state,
+                risk_state,
+                trigger_cause,
+                details
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                received_at,
+                telemetry.sensor_id,
+                event_type,
+                previous_state,
+                telemetry.risk_state,
+                telemetry.trigger_cause,
+                json.dumps(
+                    {
+                        "tilt_delta": telemetry.tilt_delta,
+                        "soil_moisture": telemetry.soil_moisture,
+                        "pore_pressure_kpa": telemetry.pore_pressure_kpa,
+                    }
+                ),
+            ),
+        )
+
+    connection.commit()
+
+    record = connection.execute(
+        """
+        SELECT id
+        FROM telemetry
+        WHERE sensor_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (telemetry.sensor_id,),
+    ).fetchone()
+
+    connection.close()
+
+    record_id = record["id"]
+
+    print(
+        f"[TELEMETRY] "
+        f"id={record_id} "
+        f"sensor={telemetry.sensor_id} "
+        f"tilt={telemetry.tilt_delta:.2f} "
+        f"moisture={telemetry.soil_moisture:.2f} "
+        f"state={telemetry.risk_state}"
+    )
+
+    if event_type is not None:
+        print(
+            f"[EVENT] "
+            f"type={event_type} "
+            f"sensor={telemetry.sensor_id} "
+            f"state={telemetry.risk_state}"
+        )
+
+    return {
+        "status": "received",
+        "id": record_id,
+        "sensor_id": telemetry.sensor_id,
+        "event_type": event_type,
+    }
+
+
+@app.get("/telemetry/")
+def list_telemetry(
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    connection = get_connection()
+
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM telemetry
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+@app.get("/events/")
+def list_events(
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    connection = get_connection()
+
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM events
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+@app.get("/stats/")
+def stats():
+    connection = get_connection()
+
+    total_packets = connection.execute(
+        "SELECT COUNT(*) AS count FROM telemetry"
+    ).fetchone()["count"]
+
+    critical_packets = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM telemetry
+        WHERE risk_state = 'CRITICAL_FAILURE'
+        """
+    ).fetchone()["count"]
+
+    warning_packets = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM telemetry
+        WHERE risk_state = 'WARNING_PENDING'
+        """
+    ).fetchone()["count"]
+
+    normal_packets = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM telemetry
+        WHERE risk_state = 'NORMAL'
+        """
+    ).fetchone()["count"]
+
+    critical_events = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM events
+        WHERE event_type = 'CRITICAL_ENTERED'
+        """
+    ).fetchone()["count"]
+
+    latest = connection.execute(
+        """
+        SELECT *
+        FROM telemetry
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    connection.close()
+
+    return {
+        "total_packets": total_packets,
+        "critical_packets": critical_packets,
+        "warning_packets": warning_packets,
+        "normal_packets": normal_packets,
+        "critical_events": critical_events,
+        "latest_sensor_id": latest["sensor_id"] if latest else None,
+        "latest_risk_state": latest["risk_state"] if latest else None,
+        "latest_trigger_cause": latest["trigger_cause"] if latest else None,
+        "latest_received_at": latest["received_at"] if latest else None,
+    }
+
+
+@app.get("/sensors/")
+def sensors():
+    connection = get_connection()
+
+    rows = connection.execute(
+        """
+        SELECT
+            sensor_id,
+            COUNT(*) AS packet_count,
+            MAX(received_at) AS last_seen,
+            (
+                SELECT risk_state
+                FROM telemetry t2
+                WHERE t2.sensor_id = t1.sensor_id
+                ORDER BY id DESC
+                LIMIT 1
+            ) AS latest_risk_state
+        FROM telemetry t1
+        GROUP BY sensor_id
+        ORDER BY last_seen DESC
+        """
+    ).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+@app.delete("/telemetry/")
+def delete_telemetry():
+    connection = get_connection()
+    connection.execute("DELETE FROM telemetry")
+    connection.execute("DELETE FROM events")
+    connection.commit()
+    connection.close()
+
+    return {
+        "status": "cleared",
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SafeSlope-NER Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 24px;
+            background: #f3f4f6;
+            color: #111827;
+        }
+
+        h1 {
+            margin-top: 0;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 18px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }
+
+        .label {
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .value {
+            font-size: 28px;
+            font-weight: bold;
+            margin-top: 8px;
+        }
+
+        .normal {
+            color: #15803d;
+        }
+
+        .warning {
+            color: #ca8a04;
+        }
+
+        .critical {
+            color: #dc2626;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+
+        th, td {
+            padding: 10px;
+            border-bottom: 1px solid #e5e7eb;
+            text-align: left;
+            font-size: 14px;
+        }
+
+        th {
+            background: #e5e7eb;
+        }
+
+        .section {
+            margin-top: 24px;
+        }
+
+        @media (max-width: 600px) {
+            body {
+                padding: 12px;
+            }
+
+            .value {
+                font-size: 22px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>SafeSlope-NER Dashboard</h1>
+
+    <div class="grid">
+        <div class="card">
+            <div class="label">Current risk state</div>
+            <div id="riskState" class="value">Loading...</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Total packets</div>
+            <div id="totalPackets" class="value">-</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Critical events</div>
+            <div id="criticalEvents" class="value">-</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Last trigger cause</div>
+            <div id="triggerCause" class="value" style="font-size: 18px;">-</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Latest telemetry</h2>
+        <div class="card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Sensor</th>
+                        <th>Tilt</th>
+                        <th>Moisture</th>
+                        <th>Pore pressure</th>
+                        <th>State</th>
+                        <th>Received</th>
+                    </tr>
+                </thead>
+                <tbody id="telemetryBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Recent events</h2>
+        <div class="card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Sensor</th>
+                        <th>Event</th>
+                        <th>State</th>
+                        <th>Cause</th>
+                    </tr>
+                </thead>
+                <tbody id="eventsBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        function stateClass(state) {
+            if (state === "CRITICAL_FAILURE") return "critical";
+            if (state === "WARNING_PENDING") return "warning";
+            if (state === "NORMAL") return "normal";
+            return "";
+        }
+
+        async function refreshDashboard() {
+            const stats = await fetch("/stats/").then(response => response.json());
+            const telemetry = await fetch("/telemetry/?limit=10")
+                .then(response => response.json());
+            const events = await fetch("/events/?limit=10")
+                .then(response => response.json());
+
+            const riskState = document.getElementById("riskState");
+            riskState.textContent = stats.latest_risk_state || "NO DATA";
+            riskState.className = "value " + stateClass(stats.latest_risk_state);
+
+            document.getElementById("totalPackets").textContent =
+                stats.total_packets;
+
+            document.getElementById("criticalEvents").textContent =
+                stats.critical_events;
+
+            document.getElementById("triggerCause").textContent =
+                stats.latest_trigger_cause || "NONE";
+
+            document.getElementById("telemetryBody").innerHTML =
+                telemetry.map(row => `
+                    <tr>
+                        <td>${row.sensor_id}</td>
+                        <td>${row.tilt_delta ?? "-"}</td>
+                        <td>${row.soil_moisture ?? "-"}</td>
+                        <td>${row.pore_pressure_kpa ?? "-"}</td>
+                        <td class="${stateClass(row.risk_state)}">
+                            ${row.risk_state ?? "-"}
+                        </td>
+                        <td>${row.received_at}</td>
+                    </tr>
+                `).join("");
+
+            document.getElementById("eventsBody").innerHTML =
+                events.map(row => `
+                    <tr>
+                        <td>${row.received_at}</td>
+                        <td>${row.sensor_id}</td>
+                        <td>${row.event_type}</td>
+                        <td>${row.risk_state ?? "-"}</td>
+                        <td>${row.trigger_cause ?? "-"}</td>
+                    </tr>
+                `).join("");
+        }
+
+        refreshDashboard();
+        setInterval(refreshDashboard, 2000);
+    </script>
+</body>
+</html>
+"""
