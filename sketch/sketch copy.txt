@@ -88,9 +88,6 @@ static constexpr uint32_t HTTP_TIMEOUT_MS = 8000;
 // Accelerometer: +/-2g
 // Gyroscope: +/-250 degrees/second
 static constexpr float MPU_ACCEL_SCALE = 16384.0f;
-static constexpr float VIBRATION_BASELINE_G = 1.0f;
-static constexpr float VIBRATION_CRITICAL_RMS_G = 0.15f;
-static constexpr float ANGULAR_RATE_CRITICAL_DPS = 45.0f;
 static constexpr float MPU_GYRO_SCALE = 131.0f;
 
 // Number of samples used for vibration RMS.
@@ -380,22 +377,22 @@ void updateSensors() {
 
   if (sensor.mpuOk) {
     sensor.accelXG =
-      static_cast<float>(rawAx) / MPU_ACCEL_SCALE;
+      static_cast<float>(rawAx) / ACCEL_SCALE_G;
 
     sensor.accelYG =
-      static_cast<float>(rawAy) / MPU_ACCEL_SCALE;
+      static_cast<float>(rawAy) / ACCEL_SCALE_G;
 
     sensor.accelZG =
-      static_cast<float>(rawAz) / MPU_ACCEL_SCALE;
+      static_cast<float>(rawAz) / ACCEL_SCALE_G;
 
     sensor.gyroXDps =
-      static_cast<float>(rawGx) / MPU_GYRO_SCALE;
+      static_cast<float>(rawGx) / GYRO_SCALE_DPS;
 
     sensor.gyroYDps =
-      static_cast<float>(rawGy) / MPU_GYRO_SCALE;
+      static_cast<float>(rawGy) / GYRO_SCALE_DPS;
 
     sensor.gyroZDps =
-      static_cast<float>(rawGz) / MPU_GYRO_SCALE;
+      static_cast<float>(rawGz) / GYRO_SCALE_DPS;
 
     const float instantPitch =
       atan2f(
@@ -509,20 +506,9 @@ void evaluateRisk() {
   // Tilt trigger.
   // ----------------------------------------------------------
 
-  else if (
-    fabsf(sensor.pitchDeg) > TILT_CRITICAL_DEG ||
-    fabsf(sensor.rollDeg) > TILT_CRITICAL_DEG
-  ) {
+  else if (fabsf(sensor.pitchDeg) > TILT_CRITICAL_DEG) {
     dangerous = true;
     cause = "SLOPE_TILT_EXCEEDED";
-  }
-
-  else if (
-    sensor.angularRateDps > ANGULAR_RATE_CRITICAL_DPS ||
-    sensor.vibrationRmsG > VIBRATION_CRITICAL_RMS_G
-  ) {
-    dangerous = true;
-    cause = "DYNAMIC_SURFACE_MOTION";
   }
 
   // ----------------------------------------------------------
@@ -585,7 +571,6 @@ void evaluateRisk() {
   else {
     const bool recovered =
       fabsf(sensor.pitchDeg) < TILT_RECOVERY_DEG &&
-      fabsf(sensor.rollDeg) < TILT_RECOVERY_DEG &&
       sensor.moisturePct < MOISTURE_RECOVERY_PCT &&
       sensor.poreKpa < PORE_RECOVERY_KPA;
 
@@ -754,44 +739,96 @@ String makeTelemetryJson() {
 void sendTelemetry() {
   const String payload = makeTelemetryJson();
 
+  // Always print telemetry locally, even if Wi-Fi or HTTP fails.
   Serial.println("[TELEMETRY] " + payload);
 
+
+  // Do not attempt HTTP until Wi-Fi is connected.
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[HTTP] skipped: WiFi not connected");
     return;
   }
 
+
+  // HTTPS client for the ngrok endpoint.
+  //
+  // setInsecure() is acceptable for this Wokwi demonstration.
+  // For production hardware, use a verified root certificate.
   WiFiClientSecure client;
+
   client.setInsecure();
 
+
   HTTPClient http;
+
   http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  static constexpr float ACCEL_SCALE_G = 16384.0f;  // MPU6050 ±2g
+  static constexpr float GYRO_SCALE_DPS = 131.0f;   // MPU6050 ±250 dps
+
+  static constexpr float VIBRATION_BASELINE_G = 1.0f;
+  static constexpr float VIBRATION_CRITICAL_RMS_G = 0.15f;
+
+  static constexpr float ANGULAR_RATE_CRITICAL_DPS = 45.0f;
   http.setTimeout(HTTP_TIMEOUT_MS);
+
 
   if (!http.begin(client, SERVER_URL)) {
     Serial.println("[HTTP] begin() failed");
     return;
   }
 
+
+  // Required headers.
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", SERVICE_API_KEY);
-  http.addHeader("ngrok-skip-browser-warning", "true");
+
+  http.addHeader(
+    "X-API-Key",
+    SERVICE_API_KEY
+  );
+
+  // Prevent the ngrok browser warning from affecting requests.
+  http.addHeader(
+    "ngrok-skip-browser-warning",
+    "true"
+  );
+
 
   const int code = http.POST(payload);
-  const String response = http.getString();
+  Serial.print("[HTTP] status: ");
+  Serial.println(code);
 
-  Serial.printf("[HTTP] status: %d\n", code);
-  Serial.println("[HTTP] response: " + response);
+  String response = http.getString();
 
-  if (code <= 0) {
+  Serial.print("[HTTP] response: ");
+  Serial.println(response);
+  http.end();
+
+
+
+  if (code > 0) {
+    const String response = http.getString();
+
+    Serial.printf(
+      "[HTTP] status: %d\n",
+      code
+    );
+
+    Serial.println(
+      "[HTTP] response: " + response
+    );
+  }
+
+  else {
     Serial.printf(
       "[HTTP] request failed: %s\n",
       http.errorToString(code).c_str()
     );
   }
 
+
   http.end();
 }
+
 
 // ============================================================
 // Wi-Fi maintenance

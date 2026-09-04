@@ -74,9 +74,6 @@ class Telemetry(BaseModel):
     # Project state
     risk_state: str | None = None
     trigger_cause: str | None = None
-    # Compatibility with earlier firmware payloads
-    state: str | None = None
-    vibration: float | None = Field(default=None, ge=0)
 
     # Device health and timing
     timestamp_ms: int | None = Field(default=None, ge=0)
@@ -86,74 +83,6 @@ class Telemetry(BaseModel):
     acoustic_valid: bool | None = None
     battery_valid: bool | None = None
 
-def classify_risk(telemetry: Telemetry) -> tuple[str, str]:
-    """
-    Calculate the risk state from sensor measurements.
-
-    Priority:
-        CRITICAL_FAILURE > WARNING_PENDING > NORMAL
-    """
-
-    # Compatibility with different firmware field names
-    soil_moisture = (
-        telemetry.soil_moisture_pct
-        if telemetry.soil_moisture_pct is not None
-        else telemetry.soil_moisture
-    )
-
-    pore_pressure = telemetry.pore_pressure_kpa or 0.0
-
-    vibration = (
-        telemetry.vibration_rms_g
-        if telemetry.vibration_rms_g is not None
-        else getattr(telemetry, "vibration", None) or 0.0
-    )
-
-    tilt = telemetry.tilt_delta or 0.0
-
-    tripwire_triggered = bool(
-        getattr(telemetry, "tripwire_flag", False)
-    )
-
-    critical_indicators = []
-
-    if tripwire_triggered:
-        critical_indicators.append("TRIPWIRE_TRIGGER")
-
-    if tilt >= 5.0:
-        critical_indicators.append("EXCESSIVE_TILT")
-
-    if pore_pressure >= 70.0:
-        critical_indicators.append("HIGH_PORE_PRESSURE")
-
-    if vibration >= 1.0:
-        critical_indicators.append("HIGH_VIBRATION")
-
-    # Any direct critical indicator causes critical state
-    if critical_indicators:
-        return "CRITICAL_FAILURE", critical_indicators[0]
-
-    warning_indicators = []
-
-    if tilt >= 3.5:
-        warning_indicators.append("ELEVATED_TILT")
-
-    if soil_moisture is not None and soil_moisture >= 85.0:
-        warning_indicators.append("HIGH_SOIL_MOISTURE")
-
-    if pore_pressure >= 50.0:
-        warning_indicators.append("ELEVATED_PORE_PRESSURE")
-
-    if vibration >= 0.3:
-        warning_indicators.append("ELEVATED_VIBRATION")
-
-    if len(warning_indicators) >= 2:
-        return "CRITICAL_FAILURE", "COMBINED_WARNING_INDICATORS"
-
-    if warning_indicators:
-        return "WARNING_PENDING", warning_indicators[0]
-
-    return "NORMAL", "NORMAL_MEASUREMENTS"
 
 def get_connection():
     connection = sqlite3.connect(DATABASE_PATH)
@@ -286,13 +215,7 @@ def receive_telemetry(
         )
 
     received_at = datetime.now(timezone.utc).isoformat()
-
-    # The backend is the source of truth for risk classification.
-    computed_state, computed_cause = classify_risk(telemetry)
-
     data = telemetry.model_dump()
-    data["risk_state"] = computed_state
-    data["trigger_cause"] = computed_cause
 
     connection = get_connection()
 
@@ -414,20 +337,17 @@ def receive_telemetry(
         },
     )
 
-    current_state = computed_state
-    current_cause = computed_cause
+    current_state = telemetry.risk_state or "UNKNOWN"
 
     if previous_state is None:
         event_type = "INITIAL_STATE"
     elif previous_state != current_state:
         if current_state == "CRITICAL_FAILURE":
             event_type = "CRITICAL_ENTERED"
-        elif previous_state == "CRITICAL_FAILURE":
-            event_type = "CRITICAL_EXITED"
-        elif current_state == "WARNING_PENDING":
-            event_type = "WARNING_ENTERED"
         elif current_state == "NORMAL":
             event_type = "RECOVERED"
+        elif current_state == "WARNING_PENDING":
+            event_type = "WARNING_ENTERED"
         else:
             event_type = "STATE_CHANGED"
     else:
@@ -452,8 +372,8 @@ def receive_telemetry(
                 telemetry.sensor_id,
                 event_type,
                 previous_state,
-                computed_state,
-                current_cause,
+                telemetry.risk_state,
+                telemetry.trigger_cause,
                 json.dumps(
                     {
                         "tilt_delta": telemetry.tilt_delta,
@@ -487,7 +407,7 @@ def receive_telemetry(
         f"sensor={telemetry.sensor_id} "
         f"tilt={telemetry.tilt_delta:.2f} "
         f"moisture={telemetry.soil_moisture:.2f} "
-        f"state={computed_state}"
+        f"state={telemetry.risk_state}"
     )
 
     if event_type is not None:
@@ -495,7 +415,7 @@ def receive_telemetry(
             f"[EVENT] "
             f"type={event_type} "
             f"sensor={telemetry.sensor_id} "
-            f"state={computed_state}"
+            f"state={telemetry.risk_state}"
         )
 
     return {
